@@ -1,0 +1,498 @@
+---
+title: "Idenfity the frauds"
+Author: Emma Wang
+---
+
+## Library
+
+```{r, warning=FALSE}
+library(tidyverse)   
+library(tidymodels)  
+library(janitor)     
+library(skimr)       
+library(vip)         
+```
+
+
+## Data
+
+```{r}
+fraud <- read_csv("project_2_training.csv") %>% clean_names()
+kaggle <- read_csv("project_2_holdout.csv") %>% clean_names()
+
+fraud %>% skim_to_wide()
+```
+
+## Target Analysis
+
+```{r}
+fraud_summary <- fraud %>%
+  count(event_label) %>%
+  mutate(pct= n/sum(n))
+
+fraud_summary %>%
+  ggplot(aes(x=factor(event_label),y=pct)) +
+  geom_col()  + 
+  geom_text(aes(label = round(pct*100,1)) , vjust = 2.5, colour = "blue") + 
+  labs(title="Bank Fraud", x="Fraud", y="PCT")
+```
+
+## Partition 
+
+```{r}
+fraud <- fraud %>%
+  mutate(event_label = as.factor(event_label)) %>%
+  mutate(billing_postal = as.character(billing_postal)) %>%
+  mutate(card_bin = as.character(card_bin)) %>%
+  mutate_if(is.character,factor)
+
+kaggle <- kaggle %>%
+  mutate(billing_postal = as.character(billing_postal)) %>%
+  mutate(card_bin = as.character(card_bin)) %>%
+  mutate_if(is.character,factor)
+
+set.seed(123)
+
+split <- initial_split(fraud, prop = 0.7)
+
+train <- training(split)
+
+test <- testing(split)
+
+sprintf("Train PCT : %1.2f%%", nrow(train)/ nrow(fraud) * 100)
+sprintf("Test  PCT : %1.2f%%", nrow(test)/ nrow(fraud) * 100)
+```
+
+
+## Recipe 
+
+```{r}
+the_recipe <- recipe(event_label ~ account_age_days + transaction_amt + transaction_adj_amt + historic_velocity + billing_state + currency + cvv + signature_image + transaction_type + transaction_env, data=train)%>% 
+  step_impute_median(all_numeric_predictors()) %>%
+  step_scale(all_numeric_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(),threshold = 0.01)%>% 
+  step_dummy(all_nominal_predictors())
+
+bake(the_recipe %>% prep(), train)
+```
+
+
+## Model & Workflow 
+
+```{r}
+logistic_model <- logistic_reg(penalty = 0.001, mixture = 1) %>%
+  set_mode("classification") %>%
+  set_engine("glm")
+
+rf_model1 <- rand_forest(trees = 10) %>% 
+  set_engine("ranger", importance="impurity") %>% 
+  set_mode("classification")
+
+rf_model2 <- rand_forest(trees = 100) %>% 
+  set_engine("ranger", importance="impurity") %>% 
+  set_mode("classification")
+
+logistic_workflow <- workflow() %>%
+  add_recipe(the_recipe) %>%
+  add_model(logistic_model) %>%
+  fit(train)
+
+rf_workflow1 <- workflow() %>%
+  add_recipe(the_recipe) %>%
+  add_model(rf_model1) %>%
+  fit(train)
+
+rf_workflow2 <- workflow() %>%
+  add_recipe(the_recipe) %>%
+  add_model(rf_model2) %>%
+  fit(train)
+
+logistic_workflow
+rf_workflow1
+rf_workflow2
+```
+
+
+## Evaluation - logistic regression
+
+```{r}
+options(yardstick.event_first = TRUE)
+
+predict(logistic_workflow, train, type = "prob") %>%
+  bind_cols(predict(logistic_workflow, train, type = "class")) %>%
+  mutate(part = "train") %>%
+  bind_cols(., train) -> logistic_scored_train
+
+predict(logistic_workflow, test, type = "prob") %>%
+  bind_cols(predict(logistic_workflow,  test, type = "class")) %>%
+  mutate(part = "testing") %>%
+  bind_cols(., test) -> logistic_scored_test
+
+bind_rows(logistic_scored_train, logistic_scored_test)  %>%
+  group_by(part) %>%
+  metrics(event_label, .pred_fraud, estimate = .pred_class) %>%
+  filter(.metric %in% c('accuracy', 'roc_auc', 'mn_log_loss')) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate)
+
+bind_rows(logistic_scored_train, logistic_scored_test) %>%
+  group_by(part) %>%
+  precision(event_label, .pred_class)
+
+bind_rows(logistic_scored_train, logistic_scored_test) %>%
+  group_by(part) %>%
+  recall(event_label, .pred_class)
+
+bind_rows(logistic_scored_train, logistic_scored_test) %>%
+  group_by(part) %>%
+  roc_curve(event_label, .pred_fraud) %>%
+  autoplot() +
+  geom_vline(xintercept = 0.05, # 5% FPR 
+             color = "red",
+             linetype = "longdash") +
+  geom_vline(xintercept = 0.25,   # 25% FPR 
+             color = "blue",
+             linetype = "longdash") +
+  geom_vline(xintercept = 0.75,   # 75% FPR 
+             color = "green",
+             linetype = "longdash") +
+  labs(title = "Logistic ROC Curve" , x = "FPR(1 - specificity)", y = "TPR(recall)") 
+
+logistic_workflow %>%
+  extract_fit_parsnip() %>%
+  vip()
+  
+```
+
+## Evaluation - random forest model 1 
+
+```{r}
+options(yardstick.event_first = TRUE)
+
+predict(rf_workflow1, train, type = "prob") %>%
+  bind_cols(predict(rf_workflow1, train, type = "class")) %>%
+  mutate(part = "train") %>%
+  bind_cols(., train) -> rf1_scored_train
+
+predict(rf_workflow1, test, type = "prob") %>%
+  bind_cols(predict(rf_workflow1,  test, type = "class")) %>%
+  mutate(part = "testing") %>%
+  bind_cols(., test) -> rf1_scored_test
+
+bind_rows (rf1_scored_train, rf1_scored_test)  %>%
+  group_by(part) %>%
+  metrics(event_label, .pred_fraud, estimate = .pred_class) %>%
+  filter(.metric %in% c('accuracy', 'roc_auc', 'mn_log_loss')) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate)
+
+bind_rows(rf1_scored_train, rf1_scored_test) %>%
+  group_by(part) %>%
+  precision(event_label, .pred_class)
+
+bind_rows(rf1_scored_train, rf1_scored_test) %>%
+  group_by(part) %>%
+  recall(event_label, .pred_class)
+
+bind_rows(rf1_scored_train, rf1_scored_test) %>%
+  group_by(part) %>%
+  roc_curve(event_label, .pred_fraud) %>%
+  autoplot() +
+  geom_vline(xintercept = 0.05, # 5% FPR 
+             color = "red",
+             linetype = "longdash") +
+  geom_vline(xintercept = 0.25,   # 25% FPR 
+             color = "blue",
+             linetype = "longdash") +
+  geom_vline(xintercept = 0.75,   # 75% FPR 
+             color = "green",
+             linetype = "longdash") +
+  labs(title = "RF1 ROC Curve" , x = "FPR(1 - specificity)", y = "TPR(recall)") 
+
+rf_workflow1 %>%
+  extract_fit_parsnip() %>%
+  vip()
+  
+```
+
+## Evaluation - random forest model 2
+
+```{r}
+options(yardstick.event_first = TRUE)
+
+predict(rf_workflow2, train, type = "prob") %>%
+  bind_cols(predict(rf_workflow2, train, type = "class")) %>%
+  mutate(part = "train") %>%
+  bind_cols(., train) -> rf2_scored_train
+
+predict(rf_workflow2, test, type = "prob") %>%
+  bind_cols(predict(rf_workflow2,  test, type = "class")) %>%
+  mutate(part = "testing") %>%
+  bind_cols(., test) -> rf2_scored_test
+
+bind_rows (rf2_scored_train, rf2_scored_test)  %>%
+  group_by(part) %>%
+  metrics(event_label, .pred_fraud, estimate = .pred_class) %>%
+  filter(.metric %in% c('accuracy', 'roc_auc', 'mn_log_loss')) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate)
+
+bind_rows(rf2_scored_train, rf2_scored_test) %>%
+  group_by(part) %>%
+  precision(event_label, .pred_class)
+
+bind_rows(rf2_scored_train, rf2_scored_test) %>%
+  group_by(part) %>%
+  recall(event_label, .pred_class)
+
+bind_rows(rf2_scored_train, rf2_scored_test) %>%
+  group_by(part) %>%
+  roc_curve(event_label, .pred_fraud) %>%
+  autoplot() +
+  geom_vline(xintercept = 0.05, # 5% FPR 
+             color = "red",
+             linetype = "longdash") +
+  geom_vline(xintercept = 0.25,   # 25% FPR 
+             color = "blue",
+             linetype = "longdash") +
+  geom_vline(xintercept = 0.75,   # 75% FPR 
+             color = "green",
+             linetype = "longdash") +
+  labs(title = "RF2 ROC Curve" , x = "FPR(1 - specificity)", y = "TPR(recall)") 
+
+rf_workflow2 %>%
+  extract_fit_parsnip() %>%
+  vip()
+```
+
+## Operational Range
+
+```{r}
+
+hist <- rf2_scored_test %>%
+  ggplot(aes(.pred_fraud, fill = event_label)) +
+  geom_histogram(bins = 50) +
+  geom_vline(xintercept = 0.5, color = "red") +
+  labs(
+    title = paste("Distribution of the Probabilty of FRAUD:", "RF Model") ,
+    x = ".pred_fraud",
+    y = "count"
+  ) 
+
+hist
+
+operating_range <- rf2_scored_test %>%
+  roc_curve(event_label, .pred_fraud)  %>%
+  mutate(
+    fpr = round((1 - specificity), 2),
+    tpr = round(sensitivity, 3),
+    score_threshold =  round(.threshold, 3)
+  ) %>%
+  group_by(fpr) %>%
+  summarise(threshold = round(mean(score_threshold),3),
+            tpr = mean(tpr)) %>%
+  filter(fpr <= 0.1)
+
+operating_range
+
+```
+
+
+## find precision & recall at threshold
+
+```{r}
+precision_funk <- function(threshold){
+  rf2_scored_test %>%
+  mutate(fpr_5_pct = as.factor(if_else(.pred_fraud >= threshold, "fraud", "legit"))) %>% 
+  precision(event_label, fpr_5_pct) %>% print()
+}
+
+precision_funk(threshold = 0.330)
+precision_funk(threshold = 0.217)
+precision_funk(threshold = 0.164)
+precision_funk(threshold = 0.132)
+precision_funk(threshold = 0.110)
+precision_funk(threshold = 0.094)
+precision_funk(threshold = 0.083)
+precision_funk(threshold = 0.073)
+precision_funk(threshold = 0.065)
+precision_funk(threshold = 0.059)
+
+recall_funk <- function(threshold){
+  rf2_scored_test %>%
+  mutate(fpr_5_pct = as.factor(if_else(.pred_fraud >= threshold,"fraud","legit"))) %>% 
+  recall(event_label, fpr_5_pct) %>% print()
+}
+
+recall_funk(threshold = 0.330)
+recall_funk(threshold = 0.217)
+recall_funk(threshold = 0.164)
+recall_funk(threshold = 0.132)
+recall_funk(threshold = 0.110)
+recall_funk(threshold = 0.094)
+recall_funk(threshold = 0.083)
+recall_funk(threshold = 0.073)
+recall_funk(threshold = 0.065)
+recall_funk(threshold = 0.059)
+```
+
+## Exploratory Analysis - Numeric
+
+```{r}
+
+imp_num_var <- fraud %>%
+  select(transaction_amt, transaction_adj_amt, account_age_days, historic_velocity)
+
+num_stat <- imp_num_var %>%
+   pivot_longer(cols = is.numeric, names_to = "column", values_to = "value") %>%
+   dplyr::select(column, value) %>%
+   group_by(column) %>%
+   summarise(count = n(),
+             val_miss = sum(is.na(value)),
+             n_dis = n_distinct(value),
+             mean = mean(value, na.rm = TRUE),
+             med = median(value, na.rm = TRUE),
+             max = max(value, na.rm = TRUE),
+             min = min(value, na.rm = TRUE),
+             std = sd(value, na.rm = TRUE)
+             )
+
+for (col in num_stat$column){
+  histo <- fraud %>%
+  ggplot(aes(!!as.name(col), fill=event_label))+
+  geom_histogram(bins=30, position = "fill") +
+  labs(title = paste("Is" , as.name(col), "a useful predictor")) +
+  ylab("pct")+ xlab(as.name(col))
+  print(histo)
+}
+
+```
+
+
+## Exploratory Analysis - Characteristic
+
+```{r}
+
+fraud %>%
+  group_by(cvv, event_label) %>%
+  summarise(n=n()) %>%
+  mutate(pct=n/sum(n)) %>%
+  ggplot(aes(y=reorder(cvv,pct),x=n, fill = event_label)) + 
+  labs(title = paste("Is cvv a useful predictor")) +
+  geom_col(position="fill")
+
+
+fraud %>%
+  group_by(transaction_env, event_label) %>%
+  summarise(n=n()) %>%
+  mutate(pct=n/sum(n)) %>%
+  ggplot(aes(y=reorder(transaction_env,pct),x=n, fill = event_label)) + 
+  labs(title = paste("Is transaction enviroment a useful predictor")) +
+  geom_col(position="fill")
+
+
+fraud %>%
+  group_by(transaction_type, event_label) %>%
+  summarise(n=n()) %>%
+  mutate(pct=n/sum(n)) %>%
+  ggplot(aes(y=reorder(transaction_type,pct),x=n, fill = event_label)) + 
+  labs(title = paste("Is transaction type a useful predictor")) +
+  geom_col(position="fill")
+
+
+fraud %>%
+  group_by(currency, event_label) %>%
+  summarise(n=n()) %>%
+  mutate(pct=n/sum(n)) %>%
+  ggplot(aes(y=reorder(currency,pct),x=n, fill = event_label)) + 
+  labs(title = paste("Is currency a useful predictor")) +
+  geom_col(position="fill")
+```
+
+## Kaggle 
+
+```{r}
+predict(rf_workflow2, kaggle, type = "prob")  %>%
+  bind_cols(kaggle) %>%
+  select(event_id,event_label = .pred_fraud)%>%
+  write_csv("rf_predicton_23.csv")
+```
+
+
+## Email_Domain
+
+```{r}
+fraud_email_domain <- train %>%
+  count(event_label, email_domain) %>%
+  pivot_wider(id_cols = email_domain, values_from = n, values_fill = 0, names_from=event_label) %>%
+  mutate(pct_fraud = fraud/(fraud+legit)) %>%
+  filter(pct_fraud > 0.1 & (fraud+legit) > 10)
+
+fraud_email_domain
+
+email_recipe <- recipe(event_label ~ email_domain,data = train) %>% 
+  step_novel(all_nominal_predictors()) %>%         
+  themis::step_downsample(event_label, under_ratio = 3) %>% 
+  step_unknown(all_nominal_predictors()) %>%       
+  step_other(all_nominal_predictors(),threshold = 10) %>%  
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+bake(email_recipe %>% prep(), train %>% sample_n(1000))
+
+email_model <- logistic_reg() %>%
+   set_mode("classification") %>%
+   set_engine("glm")
+
+email_workflow <- workflow() %>%
+  add_recipe(email_recipe) %>%
+  add_model(email_model) %>%
+  fit(train)
+
+tidy(email_workflow) %>%
+  mutate_if(is.numeric,round,3) %>%
+  filter(p.value < 0.05)
+
+tidy(email_workflow) %>%
+  mutate_if(is.numeric,round,3) %>%
+  filter(p.value > 0.05)
+```
+
+
+
+## Billing_Postal
+
+```{r}
+fraud_billing_postal <- train %>%
+  count(event_label, billing_postal) %>%
+  pivot_wider(id_cols = billing_postal, values_from = n, values_fill = 0, names_from=event_label) %>%
+  mutate(pct_fraud = fraud/(fraud+legit)) %>%
+  filter(pct_fraud > 0.1 & (fraud+legit) > 10)
+
+fraud_billing_postal
+
+
+postal_recipe <- recipe(event_label ~ billing_postal,data = train) %>% 
+  step_novel(all_nominal_predictors()) %>%         
+  themis::step_downsample(event_label, under_ratio = 3) %>% 
+  step_unknown(all_nominal_predictors()) %>%       
+  step_other(all_nominal_predictors(),threshold = 8) %>%  
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+bake(postal_recipe %>% prep(), train %>% sample_n(1000))
+
+postal_model <- logistic_reg() %>%
+   set_mode("classification") %>%
+   set_engine("glm")
+
+postal_workflow <- workflow() %>%
+  add_recipe(postal_recipe) %>%
+  add_model(postal_model) %>%
+  fit(train)
+
+tidy(postal_workflow) %>%
+  mutate_if(is.numeric,round,3) %>%
+  filter(p.value < 0.05)
+
+tidy(postal_workflow) %>%
+  mutate_if(is.numeric,round,3) %>%
+  filter(p.value > 0.05)
+```
+
